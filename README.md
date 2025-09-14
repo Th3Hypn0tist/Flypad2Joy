@@ -36,4 +36,4 @@ Then it exits.
 
 Edit the generated flypad.conf if needed.
 
-Run the script again — now it uses that config.
+Run the script again and power on the FlyPad.
