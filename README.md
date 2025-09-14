@@ -27,4 +27,13 @@ that expects an XInput controller.
   pip install bleak vgamepad
 
 ## Run
-py -3.11 flypad2joy.py
+
+Run flypad2joy_fast.py once.
+
+If no flypad.conf is found, the script writes the embedded template to disk.
+
+Then it exits.
+
+Edit the generated flypad.conf if needed.
+
+Run the script again — now it uses that config.
