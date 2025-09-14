@@ -26,5 +26,5 @@ that expects an XInput controller.
   ```bash
   pip install bleak vgamepad
 
-Run:
+## Run
 py -3.11 flypad2joy.py
