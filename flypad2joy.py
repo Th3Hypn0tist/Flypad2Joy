@@ -2,21 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-flypad2joy.py
-- Reads configuration only (no auto-calibration).
+flypad2joy_fast.py
+- Performance-tuned bridge: BLE -> ViGEm X360 (vgamepad).
+- No calibration; reads flypad.conf (same format as before).
 - If flypad.conf is missing, writes a template and exits.
-- Bridges BLE packets -> ViGEm Xbox 360 virtual gamepad.
-- Comments & prompts in English.
 """
 
-import asyncio, os, time, sys, configparser
-from typing import Dict, Any
+import asyncio, os, sys, time, configparser
+from typing import Dict, Any, Optional, Tuple, Callable, List
 from bleak import BleakScanner, BleakClient, BLEDevice, AdvertisementData
 from vgamepad import VX360Gamepad, XUSB_BUTTON
 
 CONF_PATH = os.path.join(os.path.dirname(__file__), "flypad.conf")
 EXPECTED_MIN_LEN = 6
-HB_ENABLE, HB_INTERVAL, HB_PAYLOAD = True, 0.5, b"\x01"  # optional BLE keepalive payload
+HB_ENABLE, HB_INTERVAL, HB_PAYLOAD = True, 0.5, b"\x01"
 
 TEMPLATE = """[general]
 target_name_prefix = FLYPAD_
@@ -26,20 +25,18 @@ button_lsb_index = 1
 button_msb_index = 2
 
 [axes]
-lx = 5
-ly = 6
-rx = 3
-ry = 4
+lx = -1
+ly = -1
+rx = -1
+ry = -1
 
 [axis_centers]
-; Centers (0..255). 128 is usually fine.
 lx = 128
 ly = 128
 rx = 128
 ry = 128
 
 [buttons]
-; NAME = bit,msb  (msb: 0 = LSB byte, 1 = MSB byte)
 A = 3,0
 B = 4,0
 1 = 1,0
@@ -51,7 +48,6 @@ RT = 6,0
 TAKEOFF = 0,0
 
 [triggers]
-; Bit-mode (digital) triggers from your mapping
 lt_mode = bit
 lt_bit = 0
 lt_msb = 1
@@ -64,7 +60,6 @@ rt_byte = -1
 rt_invert = 0
 
 [filters]
-; Motion feel (tune if you like)
 alpha_slow = 0.35
 alpha_fast = 0.85
 jump_threshold = 10
@@ -73,28 +68,22 @@ hysteresis = 1
 sign_guard = 2
 """
 
-# ---------- Config ----------
+# ---------- Config I/O ----------
 
 def ensure_conf() -> None:
-    """Create a template config if missing, then exit so user can fill [axes]."""
     if not os.path.exists(CONF_PATH):
-        with open(CONF_PATH, "w", encoding="utf-8") as f:
-            f.write(TEMPLATE)
+        with open(CONF_PATH, "w", encoding="utf-8") as f: f.write(TEMPLATE)
         print(f"[i] Template written: {CONF_PATH}")
-        print("    -> Open it and fill [axes] (lx/ly/rx/ry) with your 0-based packet indices.")
+        print("    -> Fill [axes] (lx/ly/rx/ry) with your 0-based packet indices.")
         sys.exit(0)
 
 def read_conf() -> Dict[str, Any]:
-    """Load config as plain dicts (avoid mixing SectionProxy and dict)."""
     ensure_conf()
     cp = configparser.ConfigParser()
     cp.read(CONF_PATH, encoding="utf-8")
-
     if not cp.has_section("general") or not cp.has_section("axes"):
-        print(f"[!] Invalid config. Edit {CONF_PATH} (need [general] and [axes]).")
-        sys.exit(1)
+        print(f"[!] Invalid config. Edit {CONF_PATH} (need [general] and [axes])."); sys.exit(1)
 
-    # Read sections as dicts
     g   = dict(cp.items("general"))
     ax  = dict(cp.items("axes"))
     cen = dict(cp.items("axis_centers")) if cp.has_section("axis_centers") else {}
@@ -102,21 +91,20 @@ def read_conf() -> Dict[str, Any]:
     btn = dict(cp.items("buttons"))      if cp.has_section("buttons")      else {}
     tr  = dict(cp.items("triggers"))     if cp.has_section("triggers")     else {}
 
-    # Parse and coerce
-    def b2(x, dflt=False):  # bool parser for strings
-        s = str(x).strip().lower()
-        return dflt if s=="" else (s in ("1","true","yes","on"))
-    def geti(d, k, dflt):
+    def geti(d, k, dflt): 
         try: return int(d.get(k, dflt))
         except: return dflt
     def getf(d, k, dflt):
         try: return float(d.get(k, dflt))
         except: return dflt
+    def getb(d, k, dflt=True):
+        v = str(d.get(k, dflt)).lower()
+        return v in ("1","true","yes","on")
 
     conf = {
         "prefix": g.get("target_name_prefix", "FLYPAD_"),
         "uuid": g.get("ctrl_char_uuid", "9e35fa01-4344-44d4-a2e2-0c7f6046878b"),
-        "invert_y": b2(g.get("invert_y", True), True),
+        "invert_y": getb(g, "invert_y", True),
         "lsb_idx": geti(g, "button_lsb_index", -1),
         "msb_idx": geti(g, "button_msb_index", -1),
         "axes": {
@@ -141,7 +129,6 @@ def read_conf() -> Dict[str, Any]:
         },
         "buttons": {},
         "triggers": {
-            # provide defaults; overridden by config if present
             "lt_mode": tr.get("lt_mode", "bit"),
             "lt_bit":  tr.get("lt_bit",  "-1"),
             "lt_msb":  tr.get("lt_msb",  "0"),
@@ -154,201 +141,262 @@ def read_conf() -> Dict[str, Any]:
             "rt_invert": tr.get("rt_invert", "0"),
         }
     }
-
-    # Buttons: NAME = bit,msb
     for k, v in btn.items():
         try:
-            bit_str, msb_str = [x.strip() for x in v.split(",", 1)]
-            conf["buttons"][k.upper()] = (int(bit_str), int(msb_str))
+            bit, msb = (int(x) for x in v.split(",", 1))
         except:
-            conf["buttons"][k.upper()] = (-1, 0)
+            bit, msb = (-1, 0)
+        conf["buttons"][k.upper()] = (bit, msb)
 
-    # Sanity checks
+    # sanity
     for k in ("lx","ly","rx","ry"):
         if conf["axes"][k] < 0:
-            print(f"[!] Missing axis index: {k}. Edit {CONF_PATH} -> [axes].")
-            sys.exit(1)
+            print(f"[!] Missing axis index: {k}. Edit {CONF_PATH} -> [axes]."); sys.exit(1)
     if conf["lsb_idx"] < 0:
-        print(f"[!] Missing button_lsb_index in [general]. Edit {CONF_PATH}.")
-        sys.exit(1)
-
+        print(f"[!] Missing button_lsb_index in [general]. Edit {CONF_PATH}."); sys.exit(1)
     return conf
 
-# ---------- Input filtering ----------
+# ---------- Filters (micro-optimized) ----------
 
 class AxisFilter:
-    """Adaptive EMA + deadzone + hysteresis + small spike guard for 0..255 -> XInput range."""
+    __slots__ = ("invert","a_s","a_f","jump","dz","hy","sg","center","ema","last","prev","sp_th","armed")
     def __init__(self, invert: bool, a_s=0.35, a_f=0.85, jump=10.0, dz=3, hy=1, sg=2, center=128):
         self.invert=invert; self.a_s=a_s; self.a_f=a_f; self.jump=jump
         self.dz=dz; self.hy=hy; self.sg=sg; self.center=center
         self.ema=None; self.last=0; self.prev=None; self.sp_th=18; self.armed=False
 
     def map(self, raw_u8: int) -> int:
-        v=float(max(0, min(255, raw_u8)))
-        if self.prev is None: self.prev=v
-        else:
-            dv=abs(v-self.prev)
-            if dv>self.sp_th and not self.armed: self.armed=True; v=self.prev
-            elif dv>self.sp_th and self.armed: self.armed=False
-            else: self.armed=False
-            self.prev=v
-        if self.ema is None: self.ema=v
-        else:
-            a=self.a_f if abs(v-self.ema)>self.jump else self.a_s
-            self.ema=a*v+(1-a)*self.ema
-        raw=255.0-self.ema if self.invert else self.ema
-        d=raw-self.center
-        in_zero=(self.last==0); leave=self.dz+(self.hy if in_zero else 0)
-        if (in_zero and abs(d)<=leave) or (not in_zero and abs(d)<=self.dz):
-            self.last=0; return 0
-        if (self.last>0 and d<0 and abs(d)<self.sg) or (self.last<0 and d>0 and abs(d)<self.sg):
-            d=abs(d)*(1 if self.last>0 else -1)
-        sign=1 if d>=0 else -1; mag=max(0.0,abs(d)-self.dz)
-        span_pos=max(1.0,255.0-self.center-self.dz); span_neg=max(1.0,self.center-self.dz)
-        full=32767 if sign>0 else 32768
-        out=int(round(mag*full/(span_pos if sign>0 else span_neg)))
-        out=min(32767,out) if sign>0 else -min(32768,out)
-        self.last=out; return out
+        v = raw_u8
+        if v < 0: v = 0
+        elif v > 255: v = 255
 
-# ---------- BLE & bridge ----------
+        pv = self.prev
+        if pv is None:
+            self.prev = float(v); self.ema = float(v)
+        else:
+            dv = abs(v - pv)
+            if dv > self.sp_th:
+                if not self.armed: self.armed = True; v = int(pv)
+                else: self.armed = False
+            else:
+                self.armed = False
+            self.prev = float(v)
+            a = self.a_f if abs(self.ema - v) > self.jump else self.a_s
+            self.ema = a * v + (1.0 - a) * self.ema  # float
+
+        raw = (255.0 - self.ema) if self.invert else self.ema
+        d = raw - self.center
+
+        last = self.last
+        in_zero = (last == 0)
+        leave = self.dz + (self.hy if in_zero else 0)
+        ad = d if d >= 0 else -d
+        if (in_zero and ad <= leave) or (not in_zero and ad <= self.dz):
+            self.last = 0; return 0
+
+        # sign guard near 0
+        if (last > 0 and d < 0 and ad < self.sg) or (last < 0 and d > 0 and ad < self.sg):
+            d = ad if last > 0 else -ad
+
+        pos = d >= 0
+        mag = ad - self.dz
+        if mag < 0: mag = 0.0
+        span_pos = (255.0 - self.center - self.dz);  span_pos = 1.0 if span_pos <= 1.0 else span_pos
+        span_neg = (self.center - self.dz);           span_neg = 1.0 if span_neg <= 1.0 else span_neg
+        full = 32767 if pos else 32768
+        out = int(mag * full / (span_pos if pos else span_neg))
+        out = (32767 if out > 32767 else out) if pos else -(32768 if out > 32768 else out)
+        self.last = out
+        return out
+
+# ---------- Bridge ----------
 
 def is_target(d: BLEDevice, a: AdvertisementData, prefix: str) -> bool:
     return (d.name or "").startswith(prefix)
 
 class Bridge:
-    """Map BLE packet bytes to ViGEm Xbox 360 gamepad via vgamepad."""
+    """Precompiled, allocation-safe mapping loop."""
+    __slots__ = ("pad","idx","f","lsb","msb","btn_masks","btn_targets","tr_l","tr_r")
+
     def __init__(self, conf: Dict[str, Any]):
         self.pad = VX360Gamepad()
+
         ax, cen, fl = conf["axes"], conf["centers"], conf["filters"]
         invy = conf["invert_y"]
         self.idx = (ax["lx"], ax["ly"], ax["rx"], ax["ry"])
-        self.f = [
+        self.f = (
             AxisFilter(False, fl["a_s"],fl["a_f"],fl["jump"],fl["dz"],fl["hy"],fl["sg"], cen["lx"]),
             AxisFilter(invy,  fl["a_s"],fl["a_f"],fl["jump"],fl["dz"],fl["hy"],fl["sg"], cen["ly"]),
             AxisFilter(False, fl["a_s"],fl["a_f"],fl["jump"],fl["dz"],fl["hy"],fl["sg"], cen["rx"]),
             AxisFilter(invy,  fl["a_s"],fl["a_f"],fl["jump"],fl["dz"],fl["hy"],fl["sg"], cen["ry"]),
-        ]
+        )
         self.lsb = conf["lsb_idx"]
         self.msb = conf.get("msb_idx", -1)
-        self.buttons = conf["buttons"]
-        self.tr = conf["triggers"]
 
-    def _btnbit(self, pkt: bytes, name: str) -> int:
-        tup = self.buttons.get(name)
-        if not tup: return 0
-        bit, msb = tup
-        if bit < 0: return 0
-        idx = self.msb if msb else self.lsb
-        if idx < 0 or idx >= len(pkt): return 0
-        return (pkt[idx] >> bit) & 1
+        # Precompile buttons -> (mask_on_lsb, mask_on_msb, target_button)
+        bmap = conf["buttons"]
+        M = XUSB_BUTTON
+        pairs = (
+            ("A", M.XUSB_GAMEPAD_A),
+            ("B", M.XUSB_GAMEPAD_B),
+            ("1", M.XUSB_GAMEPAD_X),
+            ("2", M.XUSB_GAMEPAD_Y),
+            ("LB",M.XUSB_GAMEPAD_LEFT_SHOULDER),
+            ("RB",M.XUSB_GAMEPAD_RIGHT_SHOULDER),
+            ("TAKEOFF",M.XUSB_GAMEPAD_START),
+        )
+        masks_lsb: List[Tuple[int,int]] = []
+        masks_msb: List[Tuple[int,int]] = []
+        targets:   List[int] = []
+        for name, tgt in pairs:
+            bit, msb = bmap.get(name, (-1,0))
+            if bit >= 0:
+                if msb: masks_msb.append((1 << bit, tgt))
+                else:   masks_lsb.append((1 << bit, tgt))
+                targets.append(tgt)
+        self.btn_masks = (tuple(masks_lsb), tuple(masks_msb))
+        self.btn_targets = tuple(t for _, t in masks_lsb + masks_msb)  # for releases
 
-    def _trig(self, pkt: bytes, which: str) -> int:
-        mode = self.tr.get(f"{which}_mode", "bit")
-        if mode == "byte":
-            idx = int(self.tr.get(f"{which}_byte", -1))
-            inv = int(self.tr.get(f"{which}_invert", 0))
-            if 0 <= idx < len(pkt):
-                v = pkt[idx]; return (255 - v) if inv else v
-            return 0
-        # bit mode
-        bit = int(self.tr.get(f"{which}_bit", -1))
-        msb = int(self.tr.get(f"{which}_msb", 0))
-        idx = self.msb if msb else self.lsb
-        if bit < 0 or idx < 0 or idx >= len(pkt): return 0
-        return 255 if ((pkt[idx] >> bit) & 1) else 0
+        # Precompile triggers
+        def prep_tr(side: str):
+            mode = conf["triggers"].get(f"{side}_mode", "bit")
+            if mode == "byte":
+                idx = int(conf["triggers"].get(f"{side}_byte", -1))
+                inv = int(conf["triggers"].get(f"{side}_invert", 0))
+                return ("byte", idx, inv)
+            else:
+                bit = int(conf["triggers"].get(f"{side}_bit", -1))
+                msb = int(conf["triggers"].get(f"{side}_msb", 0))
+                sel = self.msb if msb else self.lsb
+                return ("bit", bit, sel)
+        self.tr_l = prep_tr("lt")
+        self.tr_r = prep_tr("rt")
 
     def feed(self, pkt: bytes):
-        lx = self.f[0].map(pkt[self.idx[0]])
-        ly = self.f[1].map(pkt[self.idx[1]])
-        rx = self.f[2].map(pkt[self.idx[2]])
-        ry = self.f[3].map(pkt[self.idx[3]])
+        # Axis
+        f0,f1,f2,f3 = self.f
+        i0,i1,i2,i3 = self.idx
+        self.pad.left_joystick(  x_value=f0.map(pkt[i0]), y_value=f1.map(pkt[i1]) )
+        self.pad.right_joystick( x_value=f2.map(pkt[i2]), y_value=f3.map(pkt[i3]) )
 
-        self.pad.left_joystick(x_value=lx, y_value=ly)
-        self.pad.right_joystick(x_value=rx, y_value=ry)
+        # Buttons (mask test only on configured bytes)
+        ml, mm = self.btn_masks
+        lsb_idx, msb_idx = self.lsb, self.msb
+        lsb = pkt[lsb_idx] if 0 <= lsb_idx < len(pkt) else 0
+        msb = pkt[msb_idx] if 0 <= msb_idx < len(pkt) else 0
 
-        # Buttons
-        for n, b in (("A",XUSB_BUTTON.XUSB_GAMEPAD_A),
-                     ("B",XUSB_BUTTON.XUSB_GAMEPAD_B),
-                     ("1",XUSB_BUTTON.XUSB_GAMEPAD_X),
-                     ("2",XUSB_BUTTON.XUSB_GAMEPAD_Y),
-                     ("LB",XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER),
-                     ("RB",XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER),
-                     ("TAKEOFF",XUSB_BUTTON.XUSB_GAMEPAD_START)):
-            (self.pad.press_button if self._btnbit(pkt, n) else self.pad.release_button)(b)
+        # Press/release
+        pad = self.pad
+        for mask, tgt in ml:
+            if lsb & mask: pad.press_button(tgt)
+            else:          pad.release_button(tgt)
+        for mask, tgt in mm:
+            if msb & mask: pad.press_button(tgt)
+            else:          pad.release_button(tgt)
 
         # Triggers
-        self.pad.left_trigger(value=self._trig(pkt, "lt"))
-        self.pad.right_trigger(value=self._trig(pkt, "rt"))
+        tL = self.tr_l; tR = self.tr_r
+        if tL[0] == "byte":
+            idx, inv = tL[1], tL[2]
+            val = pkt[idx] if 0 <= idx < len(pkt) else 0
+            pad.left_trigger( value=(255 - val) if inv else val )
+        else:
+            bit, sel = tL[1], tL[2]
+            val = (pkt[sel] >> bit) & 1 if (bit >= 0 and 0 <= sel < len(pkt)) else 0
+            pad.left_trigger( value=255 if val else 0 )
 
-        self.pad.update()
+        if tR[0] == "byte":
+            idx, inv = tR[1], tR[2]
+            val = pkt[idx] if 0 <= idx < len(pkt) else 0
+            pad.right_trigger( value=(255 - val) if inv else val )
+        else:
+            bit, sel = tR[1], tR[2]
+            val = (pkt[sel] >> bit) & 1 if (bit >= 0 and 0 <= sel < len(pkt)) else 0
+            pad.right_trigger( value=255 if val else 0 )
 
-async def heartbeat(cli: BleakClient, writable):
-    """Optional periodic write to keep device from idling out."""
-    if not HB_ENABLE or not writable: return
-    ch = writable[0]
+        pad.update()
+
+# ---------- Heartbeat ----------
+
+async def heartbeat(cli: BleakClient, ch_uuid: Optional[str]):
+    if not HB_ENABLE or not ch_uuid: return
     while getattr(cli, "is_connected", False):
         try:
-            try: await cli.write_gatt_char(ch, HB_PAYLOAD, response=False)
-            except: await cli.write_gatt_char(ch, HB_PAYLOAD, response=True)
+            try: await cli.write_gatt_char(ch_uuid, HB_PAYLOAD, response=False)
+            except: await cli.write_gatt_char(ch_uuid, HB_PAYLOAD, response=True)
         except: pass
         await asyncio.sleep(HB_INTERVAL)
 
-# ---------- Main loop ----------
+# ---------- Main ----------
+
+def is_target(d: BLEDevice, a: AdvertisementData, prefix: str) -> bool:
+    return (d.name or "").startswith(prefix)
 
 async def run(conf: Dict[str, Any]):
     prefix, uuid = conf["prefix"], conf["uuid"]
-    evt = asyncio.Event(); found = None
+    evt = asyncio.Event(); dev: Optional[BLEDevice] = None
 
     def on_adv(d: BLEDevice, a: AdvertisementData):
-        nonlocal found
-        if is_target(d, a, prefix): found = d; evt.set()
+        nonlocal dev
+        if is_target(d, a, prefix):
+            dev = d; evt.set()
 
     sc = BleakScanner(on_adv)
     await sc.start()
     try:
-        print(f"Scanning for '{prefix}' … Press Ctrl+C to stop.")
+        print(f"Scanning for '{prefix}' … Ctrl+C to stop.")
         while True:
-            found = None; evt.clear()
+            dev = None; evt.clear()
             try: await asyncio.wait_for(evt.wait(), timeout=10.0)
             except asyncio.TimeoutError: continue
-            if not found: continue
+            if not dev: continue
 
             bridge = Bridge(conf)
             try:
-                async with BleakClient(found, timeout=10.0) as cli:
-                    # Discover writeable characteristics for optional heartbeat
-                    if not cli.services or len(list(cli.services)) == 0:
-                        getter = getattr(cli, "get_services", None)
-                        if callable(getter): await getter()
-                    writable = []
-                    for s in cli.services:
-                        for c in s.characteristics:
-                            props = set(c.properties)
-                            if "write_without_response" in props or "write" in props:
-                                writable.append(c.uuid)
-                    hb_task = asyncio.create_task(heartbeat(cli, writable)) if writable else None
+                async with BleakClient(dev, timeout=10.0) as cli:
+                    # Find one writeable char (optional heartbeat)
+                    hb_char = None
+                    try:
+                        if not cli.services or len(list(cli.services)) == 0:
+                            gs = getattr(cli, "get_services", None)
+                            if callable(gs): await gs()
+                        for s in cli.services:
+                            for c in s.characteristics:
+                                props = c.properties
+                                if ("write_without_response" in props) or ("write" in props):
+                                    hb_char = c.uuid; break
+                            if hb_char: break
+                    except: pass
 
-                    latest = bytearray()
-                    await cli.start_notify(uuid, lambda _, d: latest.__init__(bytearray(d)))
-                    # Wait initial packet
+                    volatile_pkt: Optional[bytes] = None
+                    def _cb(_, data: bytearray):
+                        # Avoid extra copy: store as bytes once per notify
+                        nonlocal volatile_pkt
+                        volatile_pkt = bytes(data)
+
+                    await cli.start_notify(uuid, _cb)
+                    # Wait first packet
                     t0 = time.time()
-                    while len(latest) == 0 and time.time() - t0 < 3.0:
-                        await asyncio.sleep(0.05)
-                    if len(latest) < EXPECTED_MIN_LEN:
-                        print("[!] Short packet; verify characteristic UUID in config.")
-                        if hb_task: hb_task.cancel()
-                        continue
-
-                    # Main feed loop
-                    while getattr(cli, "is_connected", False):
-                        if latest:
-                            bridge.feed(bytes(latest))
+                    while volatile_pkt is None and time.time() - t0 < 3.0:
                         await asyncio.sleep(0.01)
+                    if volatile_pkt is None or len(volatile_pkt) < EXPECTED_MIN_LEN:
+                        print("[!] Short/no packet; check characteristic UUID."); continue
+
+                    hb_task = asyncio.create_task(heartbeat(cli, hb_char)) if hb_char else None
+
+                    # Hot loop — keep everything local
+                    feed = bridge.feed
+                    getpkt = lambda: volatile_pkt
+                    sleep = asyncio.sleep
+                    while getattr(cli, "is_connected", False):
+                        pkt = getpkt()
+                        if pkt is not None:
+                            feed(pkt)
+                        await sleep(0.005)  # ~200 Hz loop
 
                     if hb_task: hb_task.cancel()
             except Exception as e:
-                print(f"[!] Connect error: {e} — retrying…")
-                await asyncio.sleep(2)
+                print(f"[!] Connect error: {e} — retrying…"); await asyncio.sleep(1.5)
     finally:
         await sc.stop()
 
