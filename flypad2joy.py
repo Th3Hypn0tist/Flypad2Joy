@@ -2,12 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-flypad2joy.py
-- Reads configuration only (no auto-calibration).
-- If flypad.conf is missing, writes a template and exits.
-- Bridges BLE packets -> ViGEm Xbox 360 virtual gamepad.
-- Adds Battery Service (0x180F / 0x2A19) readout + periodic battery monitoring.
-- Comments & prompts in English.
+flypad2joy_anti_spike.py
+- Same as baseline, but AxisFilter includes idle-aware anti-spike for first movement after a pause.
 """
 
 import asyncio, os, time, sys, configparser, contextlib
@@ -17,15 +13,12 @@ from vgamepad import VX360Gamepad, XUSB_BUTTON
 
 CONF_PATH = os.path.join(os.path.dirname(__file__), "flypad.conf")
 EXPECTED_MIN_LEN = 6
-
-# Optional BLE keepalive payload (if your device expects any write to stay awake)
 HB_ENABLE, HB_INTERVAL, HB_PAYLOAD = True, 0.5, b"\x01"
 
-# Battery Service
-BAT_UUID      = "00002a19-0000-1000-8000-00805f9b34fb"  # Battery Level (uint8 0..100)
-BAT_INTERVAL  = 60.0   # seconds
-BAT_WARN_PCT  = 20     # warn under this
-BAT_ENABLE    = True   # set False to disable battery reads
+BAT_UUID      = "00002a19-0000-1000-8000-00805f9b34fb"
+BAT_INTERVAL  = 60.0
+BAT_WARN_PCT  = 20
+BAT_ENABLE    = True
 
 TEMPLATE = """[general]
 target_name_prefix = FLYPAD_
@@ -41,14 +34,12 @@ rx = 3
 ry = 4
 
 [axis_centers]
-; Centers (0..255). 128 is usually fine.
 lx = 128
 ly = 128
 rx = 128
 ry = 128
 
 [buttons]
-; NAME = bit,msb  (msb: 0 = LSB byte, 1 = MSB byte)
 A = 3,0
 B = 4,0
 1 = 1,0
@@ -60,7 +51,6 @@ RT = 6,0
 TAKEOFF = 0,0
 
 [triggers]
-; Bit-mode (digital) triggers from your mapping
 lt_mode = bit
 lt_bit = 0
 lt_msb = 1
@@ -73,13 +63,18 @@ rt_byte = -1
 rt_invert = 0
 
 [filters]
-; Motion feel (tune if you like)
 alpha_slow = 0.35
 alpha_fast = 0.85
 jump_threshold = 10
 deadzone = 3
 hysteresis = 1
 sign_guard = 2
+; --- anti-spike knobs (optional; defaults shown) ---
+spike_idle_ms = 700
+spike_samples = 3
+spike_raw_step = 6
+spike_out_step = 8000
+alpha_idle = 0.20
 """
 
 # ---------- Config ----------
@@ -89,7 +84,7 @@ def ensure_conf() -> None:
         with open(CONF_PATH, "w", encoding="utf-8") as f:
             f.write(TEMPLATE)
         print(f"[i] Template written: {CONF_PATH}")
-        print("    -> Open it and fill [axes] (lx/ly/rx/ry) with your 0-based packet indices.")
+        print("    -> Fill [axes] lx/ly/rx/ry if needed.")
         sys.exit(0)
 
 def read_conf() -> Dict[str, Any]:
@@ -143,6 +138,12 @@ def read_conf() -> Dict[str, Any]:
             "dz":  geti(fl, "deadzone", 3),
             "hy":  geti(fl, "hysteresis", 1),
             "sg":  geti(fl, "sign_guard", 2),
+            # anti-spike extras (with defaults)
+            "sp_idle_ms": geti(fl, "spike_idle_ms", 700),
+            "sp_samples": geti(fl, "spike_samples", 3),
+            "sp_raw_step": geti(fl, "spike_raw_step", 6),
+            "sp_out_step": geti(fl, "spike_out_step", 8000),
+            "alpha_idle": getf(fl, "alpha_idle", 0.20),
         },
         "buttons": {},
         "triggers": {
@@ -175,59 +176,102 @@ def read_conf() -> Dict[str, Any]:
         sys.exit(1)
     return conf
 
-# ---------- Input filtering ----------
+# ---------- Input filtering (anti-spike) ----------
 
 class AxisFilter:
-    """Adaptive EMA + deadzone + hysteresis + small spike guard for 0..255 -> XInput range."""
-    def __init__(self, invert: bool, a_s=0.35, a_f=0.85, jump=10.0, dz=3, hy=1, sg=2, center=128):
+    """
+    Adaptive EMA + deadzone + hysteresis + spike guard, with idle-aware soft start.
+    After idle (no calls for sp_idle_ms), the next sp_samples are clamped in raw & output.
+    """
+    def __init__(self, invert: bool, a_s=0.35, a_f=0.85, jump=10.0, dz=3, hy=1, sg=2, center=128,
+                 sp_idle_ms=700, sp_samples=3, sp_raw_step=6, sp_out_step=8000, alpha_idle=0.20):
         self.invert=invert; self.a_s=a_s; self.a_f=a_f; self.jump=jump
         self.dz=dz; self.hy=hy; self.sg=sg; self.center=center
         self.ema=None; self.last=0; self.prev=None; self.sp_th=18; self.armed=False
+        # anti-spike
+        self.sp_idle = sp_idle_ms/1000.0
+        self.sp_samples = int(max(0, sp_samples))
+        self.sp_raw_step = float(max(0, sp_raw_step))
+        self.sp_out_step = int(max(0, sp_out_step))
+        self.alpha_idle = float(alpha_idle)
+        self._settle = 0
+        self._last_ts = time.time()
 
     def map(self, raw_u8: int) -> int:
-        v=float(max(0, min(255, raw_u8)))
-        if self.prev is None: self.prev=v
+        now = time.time()
+        if (now - self._last_ts) > self.sp_idle:
+            self._settle = self.sp_samples
+        self._last_ts = now
+
+        # clamp raw after idle to avoid first-sample jump
+        v0 = float(max(0, min(255, raw_u8)))
+        if self.prev is not None and self._settle > 0:
+            dv = v0 - self.prev
+            if dv >  self.sp_raw_step: v0 = self.prev + self.sp_raw_step
+            if dv < -self.sp_raw_step: v0 = self.prev - self.sp_raw_step
+
+        v = v0
+        if self.prev is None:
+            self.prev = v
         else:
             dv=abs(v-self.prev)
             if dv>self.sp_th and not self.armed: self.armed=True; v=self.prev
             elif dv>self.sp_th and self.armed: self.armed=False
             else: self.armed=False
             self.prev=v
-        if self.ema is None: self.ema=v
+
+        # smoothing (use slower alpha right after idle)
+        if self.ema is None:
+            self.ema=v
         else:
-            a=self.a_f if abs(v-self.ema)>self.jump else self.a_s
+            a_fast = self.alpha_idle if self._settle>0 else self.a_f
+            a = a_fast if abs(v-self.ema)>self.jump else self.a_s
             self.ema=a*v+(1-a)*self.ema
+
         raw=255.0-self.ema if self.invert else self.ema
         d=raw-self.center
         in_zero=(self.last==0); leave=self.dz+(self.hy if in_zero else 0)
         if (in_zero and abs(d)<=leave) or (not in_zero and abs(d)<=self.dz):
-            self.last=0; return 0
-        if (self.last>0 and d<0 and abs(d)<self.sg) or (self.last<0 and d>0 and abs(d)<self.sg):
-            d=abs(d)*(1 if self.last>0 else -1)
-        sign=1 if d>=0 else -1; mag=max(0.0,abs(d)-self.dz)
-        span_pos=max(1.0,255.0-self.center-self.dz); span_neg=max(1.0,self.center-self.dz)
-        full=32767 if sign>0 else 32768
-        out=int(round(mag*full/(span_pos if sign>0 else span_neg)))
-        out=min(32767,out) if sign>0 else -min(32768,out)
-        self.last=out; return out
+            out = 0
+        else:
+            if (self.last>0 and d<0 and abs(d)<self.sg) or (self.last<0 and d>0 and abs(d)<self.sg):
+                d=abs(d)*(1 if self.last>0 else -1)
+            sign=1 if d>=0 else -1; mag=max(0.0,abs(d)-self.dz)
+            span_pos=max(1.0,255.0-self.center-self.dz); span_neg=max(1.0,self.center-self.dz)
+            full=32767 if sign>0 else 32768
+            out=int(round(mag*full/(span_pos if sign>0 else span_neg)))
+            out=min(32767,out) if sign>0 else -min(32768,out)
 
-# ---------- BLE & bridge ----------
+        # clamp output delta for settle samples
+        if self._settle>0:
+            delta = out - self.last
+            if delta >  self.sp_out_step: out = self.last + self.sp_out_step
+            if delta < -self.sp_out_step: out = self.last - self.sp_out_step
+            self._settle -= 1 if self._settle>0 else 0
+
+        self.last=out
+        return out
+
+# ---------- BLE & bridge (identtinen baselineen) ----------
 
 def is_target(d: BLEDevice, a: AdvertisementData, prefix: str) -> bool:
     return (d.name or "").startswith(prefix)
 
 class Bridge:
-    """Map BLE packet bytes to ViGEm Xbox 360 gamepad via vgamepad."""
     def __init__(self, conf: Dict[str, Any]):
         self.pad = VX360Gamepad()
         ax, cen, fl = conf["axes"], conf["centers"], conf["filters"]
         invy = conf["invert_y"]
         self.idx = (ax["lx"], ax["ly"], ax["rx"], ax["ry"])
         self.f = [
-            AxisFilter(False, fl["a_s"],fl["a_f"],fl["jump"],fl["dz"],fl["hy"],fl["sg"], cen["lx"]),
-            AxisFilter(invy,  fl["a_s"],fl["a_f"],fl["jump"],fl["dz"],fl["hy"],fl["sg"], cen["ly"]),
-            AxisFilter(False, fl["a_s"],fl["a_f"],fl["jump"],fl["dz"],fl["hy"],fl["sg"], cen["rx"]),
-            AxisFilter(invy,  fl["a_s"],fl["a_f"],fl["jump"],fl["dz"],fl["hy"],fl["sg"], cen["ry"]),
+            AxisFilter(False, fl["a_s"],fl["a_f"],fl["jump"],fl["dz"],fl["hy"],fl["sg"], cen["lx"],
+                       fl["sp_idle_ms"], fl["sp_samples"], fl["sp_raw_step"], fl["sp_out_step"], fl["alpha_idle"]),
+            AxisFilter(invy,  fl["a_s"],fl["a_f"],fl["jump"],fl["dz"],fl["hy"],fl["sg"], cen["ly"],
+                       fl["sp_idle_ms"], fl["sp_samples"], fl["sp_raw_step"], fl["sp_out_step"], fl["alpha_idle"]),
+            AxisFilter(False, fl["a_s"],fl["a_f"],fl["jump"],fl["dz"],fl["hy"],fl["sg"], cen["rx"],
+                       fl["sp_idle_ms"], fl["sp_samples"], fl["sp_raw_step"], fl["sp_out_step"], fl["alpha_idle"]),
+            AxisFilter(invy,  fl["a_s"],fl["a_f"],fl["jump"],fl["dz"],fl["hy"],fl["sg"], cen["ry"],
+                       fl["sp_idle_ms"], fl["sp_samples"], fl["sp_raw_step"], fl["sp_out_step"], fl["alpha_idle"]),
         ]
         self.lsb = conf["lsb_idx"]
         self.msb = conf.get("msb_idx", -1)
@@ -279,7 +323,7 @@ class Bridge:
         self.pad.right_trigger(value=self._trig(pkt, "rt"))
         self.pad.update()
 
-# ---------- Keepalive & battery ----------
+# ---------- Keepalive & battery (kuten baseline) ----------
 
 async def heartbeat(cli: BleakClient, writable):
     if not HB_ENABLE or not writable: return
@@ -293,18 +337,16 @@ async def heartbeat(cli: BleakClient, writable):
         await asyncio.sleep(HB_INTERVAL)
 
 async def read_battery(cli: BleakClient) -> int | None:
-    """Return battery percent 0..100 or None if not available."""
     if not BAT_ENABLE: return None
     try:
         data = await cli.read_gatt_char(BAT_UUID)
         if data and len(data) >= 1:
-            return int(data[0])  # spec: 0..100
+            return int(data[0])
     except Exception:
         return None
     return None
 
 async def battery_monitor(cli: BleakClient):
-    """Poll battery level periodically and print warnings."""
     if not BAT_ENABLE: return
     while getattr(cli, "is_connected", False):
         try:
@@ -312,12 +354,12 @@ async def battery_monitor(cli: BleakClient):
             if pct is not None:
                 print(f"[i] Battery: {pct}%")
                 if pct <= BAT_WARN_PCT:
-                    print(f"[w] Battery low ({pct}%). Charge soon to avoid random disconnects.")
+                    print(f"[w] Battery low ({pct}%).")
         except Exception:
             pass
         await asyncio.sleep(BAT_INTERVAL)
 
-# ---------- Main loop ----------
+# ---------- Main loop (kuten baseline) ----------
 
 async def run(conf: Dict[str, Any]):
     prefix, uuid = conf["prefix"], conf["uuid"]
@@ -340,14 +382,12 @@ async def run(conf: Dict[str, Any]):
             bridge = Bridge(conf)
             try:
                 async with BleakClient(found, timeout=10.0) as cli:
-                    # Ensure services are cached so we can probe characteristics (battery/write)
                     if not cli.services or len(list(cli.services)) == 0:
                         getter = getattr(cli, "get_services", None)
                         if callable(getter):
                             try: await getter()
                             except Exception: pass
 
-                    # Discover writeable characteristics for optional heartbeat
                     writable = []
                     try:
                         for s in cli.services:
@@ -360,7 +400,6 @@ async def run(conf: Dict[str, Any]):
 
                     hb_task = asyncio.create_task(heartbeat(cli, writable)) if writable else None
 
-                    # Try reading battery once at connect and start monitor if present
                     bat_task = None
                     try:
                         pct = await read_battery(cli)
@@ -372,7 +411,6 @@ async def run(conf: Dict[str, Any]):
                     except Exception:
                         pass
 
-                    # Subscribe and wait for first packet
                     latest = bytearray()
                     await cli.start_notify(uuid, lambda _, d: latest.__init__(bytearray(d)))
                     t0 = time.time()
@@ -384,13 +422,11 @@ async def run(conf: Dict[str, Any]):
                             if t: t.cancel()
                         continue
 
-                    # Main feed loop
                     while getattr(cli, "is_connected", False):
                         if latest:
                             bridge.feed(bytes(latest))
                         await asyncio.sleep(0.01)
 
-                    # Cleanup tasks
                     for t in (hb_task, bat_task):
                         if t:
                             t.cancel()
