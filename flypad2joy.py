@@ -2,8 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-flypad2joy_anti_spike.py
-- Same as baseline, but AxisFilter includes idle-aware anti-spike for first movement after a pause.
+flypad2joy_anti_spike_nobatt.py
+- BLE -> ViGEm (Xbox 360) bridge Windowsille.
+- Baseline + idle-aware anti-spike tatteihin (ensiliike tauon jälkeen pehmennetään).
+- EI battery service -lukemaa (poistettu kokonaan toiveesta).
+- Optional keepalive: kirjoittaa mihin tahansa write/wr-without-response -charuun pienen pulssin.
+
+Konffi: flypad.conf (sama kuin ennen, ei akkuasetuksia).
 """
 
 import asyncio, os, time, sys, configparser, contextlib
@@ -13,12 +18,9 @@ from vgamepad import VX360Gamepad, XUSB_BUTTON
 
 CONF_PATH = os.path.join(os.path.dirname(__file__), "flypad.conf")
 EXPECTED_MIN_LEN = 6
-HB_ENABLE, HB_INTERVAL, HB_PAYLOAD = True, 0.5, b"\x01"
 
-BAT_UUID      = "00002a19-0000-1000-8000-00805f9b34fb"
-BAT_INTERVAL  = 60.0
-BAT_WARN_PCT  = 20
-BAT_ENABLE    = True
+# Optional BLE keepalive payload (jos laite pysyy hereillä kirjoituksella)
+HB_ENABLE, HB_INTERVAL, HB_PAYLOAD = True, 0.5, b"\x01"
 
 TEMPLATE = """[general]
 target_name_prefix = FLYPAD_
@@ -69,7 +71,7 @@ jump_threshold = 10
 deadzone = 3
 hysteresis = 1
 sign_guard = 2
-; --- anti-spike knobs (optional; defaults shown) ---
+; --- anti-spike knobs ---
 spike_idle_ms = 700
 spike_samples = 3
 spike_raw_step = 6
@@ -252,12 +254,13 @@ class AxisFilter:
         self.last=out
         return out
 
-# ---------- BLE & bridge (identtinen baselineen) ----------
+# ---------- BLE & bridge ----------
 
 def is_target(d: BLEDevice, a: AdvertisementData, prefix: str) -> bool:
     return (d.name or "").startswith(prefix)
 
 class Bridge:
+    """Map BLE packet bytes to ViGEm Xbox 360 gamepad via vgamepad."""
     def __init__(self, conf: Dict[str, Any]):
         self.pad = VX360Gamepad()
         ax, cen, fl = conf["axes"], conf["centers"], conf["filters"]
@@ -323,7 +326,7 @@ class Bridge:
         self.pad.right_trigger(value=self._trig(pkt, "rt"))
         self.pad.update()
 
-# ---------- Keepalive & battery (kuten baseline) ----------
+# ---------- Keepalive ----------
 
 async def heartbeat(cli: BleakClient, writable):
     if not HB_ENABLE or not writable: return
@@ -336,30 +339,7 @@ async def heartbeat(cli: BleakClient, writable):
             pass
         await asyncio.sleep(HB_INTERVAL)
 
-async def read_battery(cli: BleakClient) -> int | None:
-    if not BAT_ENABLE: return None
-    try:
-        data = await cli.read_gatt_char(BAT_UUID)
-        if data and len(data) >= 1:
-            return int(data[0])
-    except Exception:
-        return None
-    return None
-
-async def battery_monitor(cli: BleakClient):
-    if not BAT_ENABLE: return
-    while getattr(cli, "is_connected", False):
-        try:
-            pct = await read_battery(cli)
-            if pct is not None:
-                print(f"[i] Battery: {pct}%")
-                if pct <= BAT_WARN_PCT:
-                    print(f"[w] Battery low ({pct}%).")
-        except Exception:
-            pass
-        await asyncio.sleep(BAT_INTERVAL)
-
-# ---------- Main loop (kuten baseline) ----------
+# ---------- Main loop ----------
 
 async def run(conf: Dict[str, Any]):
     prefix, uuid = conf["prefix"], conf["uuid"]
@@ -382,12 +362,14 @@ async def run(conf: Dict[str, Any]):
             bridge = Bridge(conf)
             try:
                 async with BleakClient(found, timeout=10.0) as cli:
+                    # Cache services so we can locate any writable characteristic for keepalive
                     if not cli.services or len(list(cli.services)) == 0:
                         getter = getattr(cli, "get_services", None)
                         if callable(getter):
                             try: await getter()
                             except Exception: pass
 
+                    # Collect writable char UUIDs for optional heartbeat
                     writable = []
                     try:
                         for s in cli.services:
@@ -400,17 +382,7 @@ async def run(conf: Dict[str, Any]):
 
                     hb_task = asyncio.create_task(heartbeat(cli, writable)) if writable else None
 
-                    bat_task = None
-                    try:
-                        pct = await read_battery(cli)
-                        if pct is not None:
-                            print(f"[i] Battery: {pct}%")
-                            if pct <= BAT_WARN_PCT:
-                                print(f"[w] Battery low ({pct}%).")
-                            bat_task = asyncio.create_task(battery_monitor(cli))
-                    except Exception:
-                        pass
-
+                    # Subscribe and wait for first packet
                     latest = bytearray()
                     await cli.start_notify(uuid, lambda _, d: latest.__init__(bytearray(d)))
                     t0 = time.time()
@@ -418,20 +390,23 @@ async def run(conf: Dict[str, Any]):
                         await asyncio.sleep(0.05)
                     if len(latest) < EXPECTED_MIN_LEN:
                         print("[!] Short packet; verify characteristic UUID in config.")
-                        for t in (hb_task, bat_task):
-                            if t: t.cancel()
+                        if hb_task:
+                            hb_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await hb_task
                         continue
 
+                    # Main feed loop
                     while getattr(cli, "is_connected", False):
                         if latest:
                             bridge.feed(bytes(latest))
                         await asyncio.sleep(0.01)
 
-                    for t in (hb_task, bat_task):
-                        if t:
-                            t.cancel()
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await t
+                    # Cleanup
+                    if hb_task:
+                        hb_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await hb_task
 
             except Exception as e:
                 print(f"[!] Connect error: {e} — retrying…")
