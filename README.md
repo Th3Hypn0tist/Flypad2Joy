@@ -1,10 +1,15 @@
 My Parrot Mambo drone died by crash, so I had extra controller with no use.  
 
-It didn't have ready driver, so I decided to make one.  
+It didn't have ready driver, so I decided to make one.
 
 Have fun!  
 
 ---
+
+# Flypad2Joy (BLE → ViGEm, Windows)
+
+Ultra-light bridge that maps BLE notification packets to a **virtual Xbox 360 controller** via **ViGEm**.  
+Includes **idle-aware anti-spike filtering** so the first nudge after a pause won’t slam to extremes — perfect for FPV sims.
 
 ## What this does
 This project turns the **Parrot Flypad controller** into a fully working  
@@ -26,14 +31,17 @@ that expects an XInput controller.
   ```bash
   pip install bleak vgamepad
 
-## Run
+---
 
-Run flypad2joy_fast.py once.
+## Quick start
 
-If no flypad.conf is found, the script writes the embedded template to disk.
+1. **Install prerequisites**
+   - Windows 10/11
+   - Python 3.10+ (3.11 recommended)
+   - ViGEmBus driver (required by `vgamepad`)  
+   - `pip install bleak vgamepad`
 
-Then it exits.
+2. **Run once** to generate a config template:
+   ```bash
+   py -3.11 flypad2joy_anti_spike_nobatt.py
 
-Edit the generated flypad.conf if needed.
-
-Run the script again and power on the FlyPad.
