@@ -122,10 +122,10 @@ def read_conf() -> Dict[str, Any]:
         "lsb_idx": geti(g, "button_lsb_index", -1),
         "msb_idx": geti(g, "button_msb_index", -1),
         "axes": {
-            "lx": geti(ax, "lx", -1),
-            "ly": geti(ax, "ly", -1),
-            "rx": geti(ax, "rx", -1),
-            "ry": geti(ax, "ry", -1),
+            "lx": geti(ax, "lx", 5),
+            "ly": geti(ax, "ly", 6),
+            "rx": geti(ax, "rx", 3),
+            "ry": geti(ax, "ry", 4),
         },
         "centers": {
             "lx": geti(cen, "lx", 128),
