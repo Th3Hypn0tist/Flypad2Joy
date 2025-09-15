@@ -35,13 +35,7 @@ that expects an XInput controller.
 
 ## Quick start
 
-1. **Install prerequisites**
-   - Windows 10/11
-   - Python 3.10+ (3.11 recommended)
-   - ViGEmBus driver (required by `vgamepad`)  
-   - `pip install bleak vgamepad`
-
-2. **Run once** to generate a config template:
+1. **Run**
    ```bash
-   py -3.11 flypad2joy_anti_spike_nobatt.py
+   py -3.11 flypad2joy.py
 
